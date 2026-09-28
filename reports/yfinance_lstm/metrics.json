@@ -1,0 +1,50 @@
+[
+  {
+    "ticker": "TSLA",
+    "rows": 1254,
+    "start": "2021-09-27",
+    "end": "2026-09-24",
+    "train_rows": 877,
+    "validate_rows": 188,
+    "test_rows": 189,
+    "epochs_run": 50,
+    "train_rmse": 13.44128296186232,
+    "train_mae": 10.331919727089891,
+    "validate_rmse": 14.814514685124623,
+    "validate_mae": 11.136705760260098,
+    "test_rmse": 12.348021841084012,
+    "test_mae": 9.712539712031516
+  },
+  {
+    "ticker": "AMZN",
+    "rows": 1254,
+    "start": "2021-09-27",
+    "end": "2026-09-24",
+    "train_rows": 877,
+    "validate_rows": 188,
+    "test_rows": 189,
+    "epochs_run": 50,
+    "train_rmse": 5.76623530677508,
+    "train_mae": 4.335011892354827,
+    "validate_rmse": 7.232647495498589,
+    "validate_mae": 5.168937748658141,
+    "test_rmse": 9.07788712088565,
+    "test_mae": 6.271493381656361
+  },
+  {
+    "ticker": "NVDA",
+    "rows": 1254,
+    "start": "2021-09-27",
+    "end": "2026-09-24",
+    "train_rows": 877,
+    "validate_rows": 188,
+    "test_rows": 189,
+    "epochs_run": 26,
+    "train_rmse": 12.393013417866756,
+    "train_mae": 9.344647068998238,
+    "validate_rmse": 16.29913464423955,
+    "validate_mae": 13.157353763890674,
+    "test_rmse": 29.07896057534649,
+    "test_mae": 25.831011292299316
+  }
+]
