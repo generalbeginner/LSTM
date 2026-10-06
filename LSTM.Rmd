@@ -1,0 +1,762 @@
+---
+title: "Multivariate LSTM Stock Forecasting with quantmod and keras3"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  target: "Open"
+  tickers: "TSLA,AMZN,NVDA"
+  horizon: 20
+  run_pipeline: true
+  pivot_order: 2
+  pivot_min_prominence: 0
+---
+
+This notebook is the R equivalent of `run_yfinance_lstm.py`. It downloads a
+rolling five-year daily price history, creates chronological training,
+validation, and test sets, trains a multivariate LSTM, evaluates price and
+pivot predictions, and provides a recursive future-forecast helper.
+
+The full three-ticker training run is disabled by default because it downloads
+live data and trains three deep models. Run it with **Knit with Parameters** and
+set `run_pipeline` to `true`, or use:
+
+```r
+rmarkdown::render(
+  "run_yfinance_lstm.Rmd",
+  params = list(run_pipeline = TRUE)
+)
+```
+
+The `LSTM_TARGET` environment variable, when set, overrides the `target`
+parameter. Supported targets are `Open`, `Close`, `High`, and `Low`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+required_packages <- c("quantmod", "keras3", "jsonlite", "knitr")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the required R packages before running this notebook: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+runtime_cache <- file.path(tempdir(), "lstm-r-cache")
+invisible(lapply(
+  file.path(runtime_cache, c("matplotlib", "xdg")),
+  dir.create,
+  recursive = TRUE,
+  showWarnings = FALSE
+))
+Sys.setenv(
+  TF_CPP_MIN_LOG_LEVEL = "2",
+  MPLCONFIGDIR = file.path(runtime_cache, "matplotlib"),
+  XDG_CACHE_HOME = file.path(runtime_cache, "xdg")
+)
+set.seed(42L)
+keras3::set_random_seed(42L)
+```
+
+```{r directories_and_features, include=FALSE}
+PROJECT_ROOT <- normalizePath(".", mustWork = TRUE)
+DATA_DIR <- file.path(PROJECT_ROOT, "data", "yfinance")
+MODEL_DIR <- file.path(PROJECT_ROOT, "models", "R_lstm")
+REPORT_DIR <- file.path(PROJECT_ROOT, "reports", "R_lstm")
+invisible(lapply(c(DATA_DIR, MODEL_DIR, REPORT_DIR), dir.create,
+  recursive = TRUE, showWarnings = FALSE
+))
+
+FEATURES <- c("Open", "High", "Low", "Close", "Adj Close", "Volume")
+TARGETS <- c("Open", "Close", "High", "Low")
+LOOKBACK <- 60L
+SEED <- 42L
+```
+
+## Data and preprocessing helpers
+
+```{r data-helpers}
+validate_target <- function(target) {
+  if (length(target) != 1L || is.na(target) || !target %in% TARGETS) {
+    stop(
+      sprintf(
+        "target must be one of %s; received %s",
+        paste(TARGETS, collapse = ", "),
+        deparse(target)
+      ),
+      call. = FALSE
+    )
+  }
+  target
+}
+
+download_data <- function(ticker, end = Sys.Date() + 1L) {
+  start <- seq.Date(as.Date(end), by = "-5 years", length.out = 2L)[2L]
+  prices <- quantmod::getSymbols(
+    ticker,
+    src = "yahoo",
+    from = start,
+    to = as.Date(end),
+    auto.assign = FALSE,
+    warnings = FALSE
+  )
+
+  frame <- data.frame(
+    Date = as.Date(zoo::index(prices)),
+    Open = as.numeric(quantmod::Op(prices)),
+    High = as.numeric(quantmod::Hi(prices)),
+    Low = as.numeric(quantmod::Lo(prices)),
+    Close = as.numeric(quantmod::Cl(prices)),
+    `Adj Close` = as.numeric(quantmod::Ad(prices)),
+    Volume = as.numeric(quantmod::Vo(prices)),
+    check.names = FALSE
+  )
+  frame <- frame[stats::complete.cases(frame), c("Date", FEATURES), drop = FALSE]
+  frame <- frame[order(frame$Date), , drop = FALSE]
+  rownames(frame) <- NULL
+
+  if (nrow(frame) == 0L) {
+    stop(sprintf("No data returned for %s", ticker), call. = FALSE)
+  }
+  frame
+}
+
+construct_lstm_data <- function(data, sequence_size, target_idx) {
+  data <- as.matrix(data)
+  storage.mode(data) <- "double"
+  sequence_size <- as.integer(sequence_size)
+  target_idx <- as.integer(target_idx)
+
+  if (sequence_size < 1L) {
+    stop("sequence_size must be at least 1", call. = FALSE)
+  }
+  if (target_idx < 1L || target_idx > ncol(data)) {
+    stop("target_idx is outside the feature columns", call. = FALSE)
+  }
+
+  sample_count <- nrow(data) - sequence_size
+  if (sample_count <= 0L) {
+    return(list(
+      x = array(numeric(), dim = c(0L, sequence_size, ncol(data))),
+      y = numeric()
+    ))
+  }
+
+  x <- array(NA_real_, dim = c(sample_count, sequence_size, ncol(data)))
+  y <- numeric(sample_count)
+  for (i in seq_len(sample_count)) {
+    x[i, , ] <- data[i:(i + sequence_size - 1L), , drop = FALSE]
+    y[[i]] <- data[i + sequence_size, target_idx]
+  }
+  list(x = x, y = y)
+}
+
+fit_minmax_scaler <- function(data) {
+  data <- as.matrix(data)
+  storage.mode(data) <- "double"
+  data_min <- apply(data, 2L, min)
+  data_max <- apply(data, 2L, max)
+  data_range <- data_max - data_min
+  data_range[data_range == 0] <- 1
+
+  structure(
+    list(
+      data_min = data_min,
+      data_range = data_range,
+      feature_names = colnames(data)
+    ),
+    class = "lstm_minmax_scaler"
+  )
+}
+
+transform_minmax <- function(data, scaler) {
+  data <- as.matrix(data)
+  storage.mode(data) <- "double"
+  if (ncol(data) != length(scaler$data_min)) {
+    stop("data and scaler must have the same number of features", call. = FALSE)
+  }
+  sweep(sweep(data, 2L, scaler$data_min, FUN = "-"),
+    2L, scaler$data_range, FUN = "/"
+  )
+}
+
+inverse_target <- function(values, scaler, target_idx) {
+  target_idx <- as.integer(target_idx)
+  if (target_idx < 1L || target_idx > length(scaler$data_min)) {
+    stop("target_idx is outside the scaler features", call. = FALSE)
+  }
+  as.numeric(values) * scaler$data_range[[target_idx]] + scaler$data_min[[target_idx]]
+}
+
+prepare_lstm_data <- function(data, target, lookback = LOOKBACK) {
+  target <- validate_target(target)
+  lookback <- as.integer(lookback)
+  missing_features <- setdiff(FEATURES, names(data))
+  if (length(missing_features) > 0L) {
+    stop(
+      "data is missing feature columns: ",
+      paste(missing_features, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  n <- nrow(data)
+  train_end <- floor(n * 0.70)
+  validate_end <- floor(n * 0.85)
+  if (train_end <= lookback || validate_end <= train_end || validate_end >= n) {
+    stop("data does not contain enough rows for the requested splits and lookback", call. = FALSE)
+  }
+
+  train_rows <- seq_len(train_end)
+  validate_rows <- seq.int(train_end + 1L, validate_end)
+  test_rows <- seq.int(validate_end + 1L, n)
+  target_idx <- match(target, FEATURES)
+
+  scaler <- fit_minmax_scaler(data[train_rows, FEATURES, drop = FALSE])
+  all_scaled <- transform_minmax(data[, FEATURES, drop = FALSE], scaler)
+
+  train_sequences <- construct_lstm_data(
+    all_scaled[train_rows, , drop = FALSE], lookback, target_idx
+  )
+  validate_context <- seq.int(train_end - lookback + 1L, validate_end)
+  validate_sequences <- construct_lstm_data(
+    all_scaled[validate_context, , drop = FALSE], lookback, target_idx
+  )
+  test_context <- seq.int(validate_end - lookback + 1L, n)
+  test_sequences <- construct_lstm_data(
+    all_scaled[test_context, , drop = FALSE], lookback, target_idx
+  )
+
+  list(
+    scaler = scaler,
+    target_idx = target_idx,
+    split_rows = list(
+      train = train_rows,
+      validate = validate_rows,
+      test = test_rows
+    ),
+    train = c(train_sequences, list(dates = data$Date[(lookback + 1L):train_end])),
+    validate = c(validate_sequences, list(dates = data$Date[validate_rows])),
+    test = c(test_sequences, list(dates = data$Date[test_rows]))
+  )
+}
+```
+
+## Model construction
+
+The architecture matches the Python implementation: four 100-unit LSTM
+layers, a 20% dropout layer after each LSTM, and a one-unit dense output.
+
+```{r model-helper}
+build_model <- function(input_shape) {
+  model <- keras3::keras_model_sequential(input_shape = as.integer(input_shape)) |>
+    keras3::layer_lstm(units = 100L, return_sequences = TRUE) |>
+    keras3::layer_dropout(rate = 0.2) |>
+    keras3::layer_lstm(units = 100L, return_sequences = TRUE) |>
+    keras3::layer_dropout(rate = 0.2) |>
+    keras3::layer_lstm(units = 100L, return_sequences = TRUE) |>
+    keras3::layer_dropout(rate = 0.2) |>
+    keras3::layer_lstm(units = 100L, return_sequences = FALSE) |>
+    keras3::layer_dropout(rate = 0.2) |>
+    keras3::layer_dense(units = 1L)
+
+  model |> keras3::compile(
+    optimizer = "adam",
+    loss = "mean_squared_error"
+  )
+  model
+}
+```
+
+## Pivot analysis
+
+```{r pivot-helpers}
+empty_pivots <- function() {
+  data.frame(
+    Date = as.Date(character()),
+    price = numeric(),
+    pivot_type = character(),
+    stringsAsFactors = FALSE
+  )
+}
+
+detect_pivots <- function(dates, prices, pivot_order = 2L,
+                          min_prominence = 0) {
+  pivot_order <- as.integer(pivot_order)
+  if (pivot_order < 1L) {
+    stop("pivot_order must be at least 1", call. = FALSE)
+  }
+  if (length(dates) != length(prices)) {
+    stop("dates and prices must have the same length", call. = FALSE)
+  }
+
+  dates <- as.Date(dates)
+  prices <- as.numeric(prices)
+  if (length(prices) < 2L * pivot_order + 1L) {
+    return(empty_pivots())
+  }
+
+  rows <- list()
+  for (i in seq.int(pivot_order + 1L, length(prices) - pivot_order)) {
+    neighborhood <- seq.int(i - pivot_order, i + pivot_order)
+    other_indices <- neighborhood[neighborhood != i]
+    value <- prices[[i]]
+
+    if (value == max(prices[neighborhood]) &&
+        value > max(prices[other_indices]) * (1 + min_prominence)) {
+      rows[[length(rows) + 1L]] <- data.frame(
+        Date = dates[[i]], price = value, pivot_type = "high"
+      )
+    } else if (value == min(prices[neighborhood]) &&
+               value < min(prices[other_indices]) * (1 - min_prominence)) {
+      rows[[length(rows) + 1L]] <- data.frame(
+        Date = dates[[i]], price = value, pivot_type = "low"
+      )
+    }
+  }
+
+  if (length(rows) == 0L) empty_pivots() else do.call(rbind, rows)
+}
+
+empty_pivot_comparison <- function() {
+  data.frame(
+    pivot_type = character(),
+    predicted_date = as.Date(character()),
+    true_date = as.Date(character()),
+    date_error_days = integer(),
+    predicted_price = numeric(),
+    true_price = numeric(),
+    matched = logical(),
+    stringsAsFactors = FALSE
+  )
+}
+
+compare_pivots <- function(predicted, actual, max_date_gap = 5L) {
+  if (nrow(predicted) == 0L && nrow(actual) == 0L) {
+    return(empty_pivot_comparison())
+  }
+
+  predicted <- predicted[order(as.Date(predicted$Date)), , drop = FALSE]
+  actual <- actual[order(as.Date(actual$Date)), , drop = FALSE]
+  predicted$Date <- as.Date(predicted$Date)
+  actual$Date <- as.Date(actual$Date)
+  used_actual <- rep(FALSE, nrow(actual))
+  rows <- list()
+
+  if (nrow(predicted) > 0L) {
+    for (pred_idx in seq_len(nrow(predicted))) {
+      candidate_indices <- which(
+        !used_actual & actual$pivot_type == predicted$pivot_type[[pred_idx]]
+      )
+      match_idx <- NA_integer_
+      if (length(candidate_indices) > 0L) {
+        gaps <- abs(as.integer(
+          actual$Date[candidate_indices] - predicted$Date[[pred_idx]]
+        ))
+        candidate_order <- order(gaps, actual$Date[candidate_indices])
+        nearest <- candidate_indices[candidate_order[[1L]]]
+        if (gaps[candidate_order[[1L]]] <= max_date_gap) {
+          match_idx <- nearest
+        }
+      }
+
+      if (is.na(match_idx)) {
+        rows[[length(rows) + 1L]] <- data.frame(
+          pivot_type = predicted$pivot_type[[pred_idx]],
+          predicted_date = predicted$Date[[pred_idx]],
+          true_date = as.Date(NA),
+          date_error_days = NA_integer_,
+          predicted_price = predicted$price[[pred_idx]],
+          true_price = NA_real_,
+          matched = FALSE
+        )
+      } else {
+        used_actual[[match_idx]] <- TRUE
+        rows[[length(rows) + 1L]] <- data.frame(
+          pivot_type = predicted$pivot_type[[pred_idx]],
+          predicted_date = predicted$Date[[pred_idx]],
+          true_date = actual$Date[[match_idx]],
+          date_error_days = abs(as.integer(
+            predicted$Date[[pred_idx]] - actual$Date[[match_idx]]
+          )),
+          predicted_price = predicted$price[[pred_idx]],
+          true_price = actual$price[[match_idx]],
+          matched = TRUE
+        )
+      }
+    }
+  }
+
+  unused_actual <- which(!used_actual)
+  for (actual_idx in unused_actual) {
+    rows[[length(rows) + 1L]] <- data.frame(
+      pivot_type = actual$pivot_type[[actual_idx]],
+      predicted_date = as.Date(NA),
+      true_date = actual$Date[[actual_idx]],
+      date_error_days = NA_integer_,
+      predicted_price = NA_real_,
+      true_price = actual$price[[actual_idx]],
+      matched = FALSE
+    )
+  }
+
+  result <- do.call(rbind, rows)
+  result[order(result$predicted_date, result$true_date, na.last = TRUE), , drop = FALSE]
+}
+```
+
+## Recursive forecast helpers
+
+As in the Python version, future values for non-target features are unknown.
+The recursive forecast therefore replaces only the selected target with the
+model prediction and carries the latest scaled values of the other features
+forward. This is a scenario forecast rather than a complete market simulator.
+
+```{r forecast-helpers}
+business_days <- function(last_date, horizon) {
+  horizon <- as.integer(horizon)
+  if (horizon < 0L) {
+    stop("horizon cannot be negative", call. = FALSE)
+  }
+  if (horizon == 0L) {
+    return(as.Date(character()))
+  }
+
+  candidate_count <- ceiling(horizon * 7 / 5) + 7L
+  candidates <- seq.Date(
+    as.Date(last_date) + 1L,
+    by = "day",
+    length.out = candidate_count
+  )
+  weekday_number <- as.POSIXlt(candidates)$wday
+  candidates[!weekday_number %in% c(0L, 6L)][seq_len(horizon)]
+}
+
+forecast_future <- function(model, recent_data, scaler, target, horizon,
+                            lookback = LOOKBACK) {
+  target <- validate_target(target)
+  lookback <- as.integer(lookback)
+  horizon <- as.integer(horizon)
+  if (nrow(recent_data) < lookback) {
+    stop(
+      sprintf("recent_data must contain at least %d rows", lookback),
+      call. = FALSE
+    )
+  }
+  if (horizon < 1L) {
+    stop("horizon must be at least 1", call. = FALSE)
+  }
+
+  target_idx <- match(target, FEATURES)
+  values <- as.matrix(tail(recent_data[, FEATURES, drop = FALSE], lookback))
+  scaled <- transform_minmax(values, scaler)
+  forecasts <- numeric(horizon)
+
+  for (step in seq_len(horizon)) {
+    model_input <- array(scaled, dim = c(1L, lookback, length(FEATURES)))
+    next_scaled <- as.numeric(stats::predict(model, model_input, verbose = 0))[[1L]]
+    next_row <- scaled[nrow(scaled), ]
+    next_row[[target_idx]] <- next_scaled
+    forecasts[[step]] <- inverse_target(next_scaled, scaler, target_idx)
+    scaled <- rbind(scaled[-1L, , drop = FALSE], next_row)
+  }
+
+  result <- data.frame(
+    Date = business_days(tail(recent_data$Date, 1L), horizon),
+    forecast = forecasts,
+    check.names = FALSE
+  )
+  names(result)[[2L]] <- target
+  result
+}
+
+save_forecast_pivots <- function(forecast, ticker, target,
+                                 pivot_order = 2L,
+                                 min_prominence = 0,
+                                 report_dir = REPORT_DIR) {
+  target <- validate_target(target)
+  pivots <- detect_pivots(
+    forecast$Date,
+    forecast[[target]],
+    pivot_order,
+    min_prominence
+  )
+  dir.create(report_dir, recursive = TRUE, showWarnings = FALSE)
+  start <- format(min(as.Date(forecast$Date)), "%Y-%m-%d")
+  end <- format(max(as.Date(forecast$Date)), "%Y-%m-%d")
+  output <- file.path(
+    report_dir,
+    sprintf(
+      "%s_%s_forecast_pivots_%s_to_%s.csv",
+      tolower(ticker), tolower(target), start, end
+    )
+  )
+  utils::write.csv(pivots, output, row.names = FALSE)
+  output
+}
+
+forecast_ticker <- function(ticker, target, horizon = 20L,
+                            pivot_order = 2L,
+                            min_prominence = 0) {
+  target <- validate_target(target)
+  model_path <- file.path(
+    MODEL_DIR,
+    sprintf("%s_%s_lstm.keras", tolower(ticker), tolower(target))
+  )
+  scaler_path <- file.path(
+    MODEL_DIR,
+    sprintf("%s_%s_scaler.rds", tolower(ticker), tolower(target))
+  )
+  data_path <- file.path(DATA_DIR, sprintf("%s_raw.csv", tolower(ticker)))
+
+  model <- keras3::load_model(model_path)
+  scaler <- readRDS(scaler_path)
+  recent_data <- utils::read.csv(data_path, check.names = FALSE)
+  recent_data$Date <- as.Date(recent_data$Date)
+  forecast <- forecast_future(model, recent_data, scaler, target, horizon)
+  pivot_output <- save_forecast_pivots(
+    forecast, ticker, target, pivot_order, min_prominence
+  )
+  list(forecast = forecast, pivot_output = pivot_output)
+}
+```
+
+## Training, evaluation, and reporting
+
+```{r training-helper}
+prediction_metrics <- function(actual, predicted) {
+  data.frame(
+    rmse = sqrt(mean((actual - predicted)^2)),
+    mae = mean(abs(actual - predicted))
+  )
+}
+
+history_epochs <- function(history) {
+  as.integer(length(history$metrics$loss))
+}
+
+plot_results <- function(data, prepared, predictions, ticker, target,
+                         output_path) {
+  grDevices::png(output_path, width = 2250, height = 1500, res = 150)
+  old_par <- graphics::par(mfrow = c(2L, 1L), mar = c(4, 4, 3, 1))
+  on.exit({
+    graphics::par(old_par)
+    grDevices::dev.off()
+  }, add = TRUE)
+
+  graphics::plot(
+    data$Date, data[[target]],
+    type = "l", col = "black", lwd = 1,
+    xlab = "Date", ylab = sprintf("%s price (USD)", target),
+    main = sprintf("%s: five-year daily %s price and chronological splits", ticker, target)
+  )
+  split_rows <- prepared$split_rows
+  graphics::abline(v = data$Date[min(split_rows$validate)], col = "orange", lty = 2)
+  graphics::abline(v = data$Date[min(split_rows$test)], col = "darkgreen", lty = 2)
+  graphics::legend(
+    "topleft",
+    legend = c(sprintf("Actual %s", target), "Validation start", "Test start"),
+    col = c("black", "orange", "darkgreen"),
+    lty = c(1, 2, 2),
+    bty = "n"
+  )
+  graphics::grid(col = "grey85")
+
+  all_dates <- do.call(c, lapply(predictions, `[[`, "dates"))
+  all_values <- unlist(lapply(
+    predictions,
+    function(item) c(item$actual, item$predicted)
+  ))
+  graphics::plot(
+    range(all_dates), range(all_values, finite = TRUE),
+    type = "n", xlab = "Date", ylab = sprintf("%s price (USD)", target),
+    main = sprintf("%s: LSTM next-day %s predictions", ticker, target)
+  )
+  colors <- c(train = "#1b6ca8", validate = "#d97706", test = "#16803c")
+  for (split_name in names(predictions)) {
+    item <- predictions[[split_name]]
+    graphics::lines(item$dates, item$actual, col = colors[[split_name]], lwd = 1)
+    graphics::lines(item$dates, item$predicted,
+      col = colors[[split_name]], lwd = 1, lty = 2
+    )
+  }
+  graphics::legend(
+    "topleft",
+    legend = as.vector(rbind(
+      paste(tools::toTitleCase(names(predictions)), "actual"),
+      paste(tools::toTitleCase(names(predictions)), "predicted")
+    )),
+    col = rep(colors, each = 2L),
+    lty = rep(c(1, 2), times = length(colors)),
+    ncol = 3L,
+    bty = "n"
+  )
+  graphics::grid(col = "grey85")
+  invisible(output_path)
+}
+
+run_ticker <- function(ticker, target) {
+  target <- validate_target(target)
+  set.seed(SEED)
+  keras3::set_random_seed(SEED)
+
+  data <- download_data(ticker)
+  data_path <- file.path(DATA_DIR, sprintf("%s_raw.csv", tolower(ticker)))
+  utils::write.csv(data, data_path, row.names = FALSE)
+
+  prepared <- prepare_lstm_data(data, target, LOOKBACK)
+  scaler_path <- file.path(
+    MODEL_DIR,
+    sprintf("%s_%s_scaler.rds", tolower(ticker), tolower(target))
+  )
+  saveRDS(prepared$scaler, scaler_path)
+
+  model <- build_model(c(LOOKBACK, length(FEATURES)))
+  model_path <- file.path(
+    MODEL_DIR,
+    sprintf("%s_%s_lstm.keras", tolower(ticker), tolower(target))
+  )
+  callbacks <- list(
+    keras3::callback_model_checkpoint(
+      filepath = model_path,
+      monitor = "val_loss",
+      save_best_only = TRUE,
+      mode = "min"
+    ),
+    keras3::callback_early_stopping(
+      monitor = "val_loss",
+      patience = 25L,
+      restore_best_weights = TRUE
+    )
+  )
+  history <- model |> keras3::fit(
+    x = prepared$train$x,
+    y = prepared$train$y,
+    validation_data = list(prepared$validate$x, prepared$validate$y),
+    epochs = 50L,
+    batch_size = 64L,
+    callbacks = callbacks,
+    verbose = 0L
+  )
+
+  best_model <- keras3::load_model(model_path)
+  predictions <- lapply(
+    c("train", "validate", "test"),
+    function(split_name) {
+      split <- prepared[[split_name]]
+      list(
+        actual = inverse_target(
+          split$y, prepared$scaler, prepared$target_idx
+        ),
+        predicted = inverse_target(
+          as.numeric(stats::predict(best_model, split$x, verbose = 0L)),
+          prepared$scaler,
+          prepared$target_idx
+        ),
+        dates = split$dates
+      )
+    }
+  )
+  names(predictions) <- c("train", "validate", "test")
+
+  metrics <- data.frame(
+    ticker = ticker,
+    target = target,
+    rows = nrow(data),
+    start = format(min(data$Date), "%Y-%m-%d"),
+    end = format(max(data$Date), "%Y-%m-%d"),
+    train_rows = length(prepared$split_rows$train),
+    validate_rows = length(prepared$split_rows$validate),
+    test_rows = length(prepared$split_rows$test),
+    epochs_run = history_epochs(history),
+    stringsAsFactors = FALSE
+  )
+  for (split_name in names(predictions)) {
+    split_metrics <- prediction_metrics(
+      predictions[[split_name]]$actual,
+      predictions[[split_name]]$predicted
+    )
+    metrics[[paste0(split_name, "_rmse")]] <- split_metrics$rmse
+    metrics[[paste0(split_name, "_mae")]] <- split_metrics$mae
+  }
+
+  pivot_rows <- lapply(names(predictions), function(split_name) {
+    item <- predictions[[split_name]]
+    predicted_pivots <- detect_pivots(
+      item$dates, item$predicted,
+      params$pivot_order, params$pivot_min_prominence
+    )
+    actual_pivots <- detect_pivots(
+      item$dates, item$actual,
+      params$pivot_order, params$pivot_min_prominence
+    )
+    comparison <- compare_pivots(predicted_pivots, actual_pivots)
+    data.frame(split = rep(split_name, nrow(comparison)), comparison)
+  })
+  pivot_dates <- do.call(rbind, pivot_rows)
+  pivot_path <- file.path(
+    REPORT_DIR,
+    sprintf(
+      "%s_%s_pivots_%s_to_%s.csv",
+      tolower(ticker), tolower(target),
+      format(min(data$Date), "%Y-%m-%d"),
+      format(max(data$Date), "%Y-%m-%d")
+    )
+  )
+  utils::write.csv(pivot_dates, pivot_path, row.names = FALSE)
+
+  plot_results(
+    data, prepared, predictions, ticker, target,
+    file.path(REPORT_DIR, sprintf("%s_%s_results.png", tolower(ticker), tolower(target)))
+  )
+  metrics
+}
+```
+
+## Execute the pipeline
+
+```{r run-pipeline}
+TARGET <- validate_target(Sys.getenv("LSTM_TARGET", unset = params$target))
+TICKERS <- trimws(strsplit(params$tickers, ",", fixed = TRUE)[[1L]])
+results <- NULL
+
+if (isTRUE(params$run_pipeline)) {
+  results <- do.call(rbind, lapply(TICKERS, run_ticker, target = TARGET))
+  utils::write.csv(
+    results,
+    file.path(REPORT_DIR, "metrics.csv"),
+    row.names = FALSE
+  )
+  jsonlite::write_json(
+    results,
+    file.path(REPORT_DIR, "metrics.json"),
+    dataframe = "rows",
+    pretty = TRUE,
+    auto_unbox = TRUE,
+    na = "null"
+  )
+  knitr::kable(results, digits = 4)
+} else {
+  cat("Pipeline execution is disabled. Set `run_pipeline: true` to train the models.")
+}
+```
+
+After a model has been trained, generate a 20-business-day recursive forecast
+and save its predicted pivots with:
+
+```{r forecast-example, eval=FALSE}
+tsla_forecast <- forecast_ticker(
+  "TSLA",
+  target = TARGET,
+  horizon = params$horizon,
+  pivot_order = params$pivot_order,
+  min_prominence = params$pivot_min_prominence
+)
+tsla_forecast$forecast
+tsla_forecast$pivot_output
+```

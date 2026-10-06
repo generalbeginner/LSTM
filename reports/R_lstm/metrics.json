@@ -1,0 +1,53 @@
+[
+  {
+    "ticker": "TSLA",
+    "target": "Open",
+    "rows": 1254,
+    "start": "2021-10-06",
+    "end": "2026-10-05",
+    "train_rows": 877,
+    "validate_rows": 188,
+    "test_rows": 189,
+    "epochs_run": 50,
+    "train_rmse": 14.6738,
+    "train_mae": 11.6149,
+    "validate_rmse": 14.5581,
+    "validate_mae": 11.0259,
+    "test_rmse": 13.8992,
+    "test_mae": 11.1537
+  },
+  {
+    "ticker": "AMZN",
+    "target": "Open",
+    "rows": 1254,
+    "start": "2021-10-06",
+    "end": "2026-10-05",
+    "train_rows": 877,
+    "validate_rows": 188,
+    "test_rows": 189,
+    "epochs_run": 50,
+    "train_rmse": 5.6359,
+    "train_mae": 4.2451,
+    "validate_rmse": 7.0539,
+    "validate_mae": 5.034,
+    "test_rmse": 9.3059,
+    "test_mae": 6.4176
+  },
+  {
+    "ticker": "NVDA",
+    "target": "Open",
+    "rows": 1254,
+    "start": "2021-10-06",
+    "end": "2026-10-05",
+    "train_rows": 877,
+    "validate_rows": 188,
+    "test_rows": 189,
+    "epochs_run": 50,
+    "train_rmse": 6.5385,
+    "train_mae": 4.1996,
+    "validate_rmse": 10.4595,
+    "validate_mae": 8.381,
+    "test_rmse": 22.532,
+    "test_mae": 19.8119
+  }
+]
