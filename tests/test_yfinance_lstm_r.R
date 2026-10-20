@@ -7,7 +7,7 @@ Sys.setenv(
 )
 
 project_root <- normalizePath(".", mustWork = TRUE)
-rmd_path <- file.path(project_root, "run_yfinance_lstm.Rmd")
+rmd_path <- file.path(project_root, "LSTM_functions.Rmd")
 
 load_rmd_functions <- function() {
   if (!file.exists(rmd_path)) {
@@ -17,14 +17,6 @@ load_rmd_functions <- function() {
   source_path <- tempfile(fileext = ".R")
   knitr::purl(rmd_path, output = source_path, quiet = TRUE)
   source_env <- new.env(parent = globalenv())
-  source_env$params <- list(
-    target = "Open",
-    tickers = "TSLA,AMZN,NVDA",
-    horizon = 20L,
-    run_pipeline = FALSE,
-    pivot_order = 2L,
-    pivot_min_prominence = 0
-  )
   old_wd <- setwd(project_root)
   on.exit(setwd(old_wd), add = TRUE)
   sys.source(source_path, envir = source_env)
@@ -39,13 +31,18 @@ required_functions <- c(
   "transform_minmax",
   "inverse_target",
   "prepare_lstm_data",
+  "build_outcome_frames",
   "detect_pivots",
   "compare_pivots",
+  "build_pivot_analysis",
   "business_days",
   "build_model",
   "history_epochs",
   "forecast_future",
-  "save_forecast_pivots"
+  "forecast_pivots",
+  "plot_outcomes",
+  "plot_pivots",
+  "plot_pivot_date_distribution"
 )
 
 if (!load_rmd_functions()) {
@@ -113,6 +110,40 @@ test_that("prepare_lstm_data keeps lookback context across chronological splits"
   expect_equal(prepared$test$dates[[1]], dates[[86]])
 })
 
+test_that("build_outcome_frames keeps actual and predicted values separate", {
+  predictions <- list(
+    train = list(
+      dates = as.Date(c("2026-01-01", "2026-01-02")),
+      actual = c(10, 11),
+      predicted = c(9.5, 10.5)
+    ),
+    validate = list(
+      dates = as.Date("2026-01-03"),
+      actual = 12,
+      predicted = 11.5
+    ),
+    test = list(
+      dates = as.Date("2026-01-04"),
+      actual = 13,
+      predicted = 12.5
+    )
+  )
+
+  outcomes <- build_outcome_frames(predictions, ticker = "GC=F", target = "Close")
+
+  expect_named(
+    outcomes$actual_outcomes,
+    c("ticker", "target", "split", "Date", "actual")
+  )
+  expect_named(
+    outcomes$predicted_outcomes,
+    c("ticker", "target", "split", "Date", "predicted")
+  )
+  expect_equal(outcomes$actual_outcomes$actual, c(10, 11, 12, 13))
+  expect_equal(outcomes$predicted_outcomes$predicted, c(9.5, 10.5, 11.5, 12.5))
+  expect_equal(outcomes$actual_outcomes$split, c("train", "train", "validate", "test"))
+})
+
 test_that("detect_pivots finds strict local highs and lows", {
   dates <- as.Date("2026-01-01") + 0:4
   pivots <- detect_pivots(dates, c(10, 12, 9, 11, 8), pivot_order = 1L)
@@ -136,9 +167,42 @@ test_that("compare_pivots matches the nearest unused pivot of the same type", {
   compared <- compare_pivots(predicted, actual, max_date_gap = 1L)
 
   expect_true(compared$matched[[1]])
+  expect_equal(compared$date_difference_days[[1]], -1L)
   expect_equal(compared$date_error_days[[1]], 1)
   expect_false(compared$matched[[2]])
   expect_true(any(is.na(compared$predicted_date)))
+})
+
+test_that("build_pivot_analysis stores pivot dates and date differences", {
+  dates <- as.Date("2026-01-01") + 0:4
+  actual_outcomes <- data.frame(
+    ticker = "EURUSD=X", target = "Close", split = "test",
+    Date = dates, actual = c(1, 3, 1, 3, 1)
+  )
+  predicted_outcomes <- data.frame(
+    ticker = "EURUSD=X", target = "Close", split = "test",
+    Date = dates, predicted = c(1, 2, 4, 1, 3)
+  )
+
+  pivots <- build_pivot_analysis(
+    actual_outcomes,
+    predicted_outcomes,
+    pivot_order = 1L,
+    max_date_gap = 2L
+  )
+
+  expect_named(
+    pivots,
+    c("actual_pivots", "predicted_pivots", "pivot_date_differences")
+  )
+  expect_equal(unique(pivots$actual_pivots$source), "Actual")
+  expect_equal(unique(pivots$predicted_pivots$source), "Predicted")
+  expect_true(any(pivots$pivot_date_differences$matched))
+  expect_true(all(
+    pivots$pivot_date_differences$date_difference_days[
+      pivots$pivot_date_differences$matched
+    ] == 1L
+  ))
 })
 
 test_that("business_days excludes weekends", {
@@ -192,23 +256,125 @@ test_that("forecast_future recursively produces weekday target forecasts", {
   expect_equal(forecast$Open, c(10, 10))
 })
 
-test_that("save_forecast_pivots writes a date-windowed CSV", {
-  output_dir <- tempfile("forecast-pivots-")
-  dir.create(output_dir)
+test_that("forecast_pivots returns pivots without writing a file", {
   forecast <- data.frame(
     Date = as.Date("2026-10-05") + 0:4,
     Close = c(10, 12, 9, 11, 8)
   )
 
-  output <- save_forecast_pivots(
+  pivots <- forecast_pivots(
     forecast,
-    ticker = "TSLA",
     target = "Close",
-    pivot_order = 1L,
-    report_dir = output_dir
+    pivot_order = 1L
   )
 
-  expect_true(file.exists(output))
-  expect_match(basename(output), "tsla_close_forecast_pivots_2026-10-05_to_2026-10-09\\.csv")
-  expect_equal(nrow(read.csv(output)), 3L)
+  expect_equal(nrow(pivots), 3L)
+  expect_named(pivots, c("Date", "price", "pivot_type"))
+})
+
+test_that("plot_outcomes creates separate actual and predicted line traces", {
+  actual <- data.frame(
+    ticker = "TSLA", target = "Close", split = c("train", "test"),
+    Date = as.Date(c("2026-01-01", "2026-01-02")), actual = c(10, 12)
+  )
+  predicted <- data.frame(
+    ticker = "TSLA", target = "Close", split = c("train", "test"),
+    Date = as.Date(c("2026-01-01", "2026-01-02")), predicted = c(9, 11)
+  )
+
+  figure <- plot_outcomes(actual, predicted, ticker = "TSLA", target = "Close")
+  traces <- plotly::plotly_build(figure)$x$data
+
+  expect_s3_class(figure, "plotly")
+  expect_equal(length(traces), 2L)
+  expect_equal(vapply(traces, `[[`, character(1), "mode"), c("lines", "lines"))
+})
+
+test_that("plot_pivots renders hoverable marker traces for both sources", {
+  dates <- as.Date("2026-01-01") + 0:4
+  actual <- data.frame(
+    ticker = "TSLA", target = "Close", split = "test",
+    Date = dates, actual = c(1, 3, 1, 3, 1)
+  )
+  predicted <- data.frame(
+    ticker = "TSLA", target = "Close", split = "test",
+    Date = dates, predicted = c(1, 2, 4, 1, 3)
+  )
+  pivots <- build_pivot_analysis(actual, predicted, pivot_order = 1L)
+
+  figure <- plot_pivots(
+    actual, predicted,
+    pivots$actual_pivots, pivots$predicted_pivots,
+    ticker = "TSLA", target = "Close"
+  )
+  traces <- plotly::plotly_build(figure)$x$data
+  marker_traces <- Filter(function(trace) identical(trace$mode, "markers"), traces)
+  actual_markers <- Filter(function(trace) grepl("^Actual", trace$name), marker_traces)
+  predicted_markers <- Filter(function(trace) grepl("^Predicted", trace$name), marker_traces)
+
+  expect_s3_class(figure, "plotly")
+  expect_equal(length(marker_traces), 4L)
+  expect_true(all(vapply(marker_traces, function(trace) {
+    all(trace$hoverinfo == "text")
+  }, logical(1))))
+  expect_true(all(vapply(actual_markers, function(trace) {
+    grepl("-open$", trace$marker$symbol)
+  }, logical(1))))
+  expect_true(all(vapply(predicted_markers, function(trace) {
+    !grepl("-open$", trace$marker$symbol)
+  }, logical(1))))
+})
+
+test_that("plot_pivot_date_distribution charts matched signed differences", {
+  differences <- data.frame(
+    ticker = "TSLA", target = "Close",
+    split = c("test", "test", "test", "test"),
+    pivot_type = c("high", "high", "low", "low"),
+    predicted_date = as.Date(c("2026-01-03", "2026-01-05", "2026-01-07", NA)),
+    true_date = as.Date(c("2026-01-02", "2026-01-06", "2026-01-05", "2026-01-10")),
+    date_difference_days = c(1L, -1L, 2L, NA_integer_),
+    date_error_days = c(1L, 1L, 2L, NA_integer_),
+    predicted_price = c(10, 11, 9, NA_real_),
+    true_price = c(10.5, 10.5, 9.5, 8.5),
+    matched = c(TRUE, TRUE, TRUE, FALSE)
+  )
+
+  figure <- plot_pivot_date_distribution(
+    differences, ticker = "TSLA", target = "Close"
+  )
+  traces <- plotly::plotly_build(figure)$x$data
+
+  expect_s3_class(figure, "plotly")
+  expect_equal(length(traces), 2L)
+  expect_true(all(vapply(traces, function(trace) {
+    identical(trace$type, "histogram")
+  }, logical(1))))
+  expect_equal(
+    sort(unlist(lapply(traces, `[[`, "x"), use.names = FALSE)),
+    c(-1L, 1L, 2L)
+  )
+})
+
+test_that("plot_pivot_date_distribution has an explicit unmatched-only state", {
+  differences <- data.frame(
+    ticker = "TSLA", target = "Close", split = "test",
+    pivot_type = "high", predicted_date = as.Date(NA),
+    true_date = as.Date("2026-01-10"),
+    date_difference_days = NA_integer_, date_error_days = NA_integer_,
+    predicted_price = NA_real_, true_price = 10,
+    matched = FALSE
+  )
+
+  figure <- plot_pivot_date_distribution(
+    differences, ticker = "TSLA", target = "Close"
+  )
+  built <- plotly::plotly_build(figure)
+  trace <- built$x$data[[1L]]
+
+  expect_equal(trace$type, "scatter")
+  expect_equal(trace$mode, "markers")
+  expect_equal(trace$hoverinfo, "skip")
+  expect_false(trace$showlegend)
+  expect_length(trace[["x"]], 0L)
+  expect_match(built$x$layout$annotations[[1L]]$text, "No matched pivot")
 })
